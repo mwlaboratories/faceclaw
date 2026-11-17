@@ -1,0 +1,9 @@
+# yaml-language-server: $schema=https://devenv.sh/devenv.schema.json
+inputs:
+  nixpkgs:
+    url: github:cachix/devenv-nixpkgs/rolling
+nixpkgs:
+  # Android SDK is unfree and needs its license accepted.
+  allow_unfree: true
+  android_sdk:
+    accept_license: true

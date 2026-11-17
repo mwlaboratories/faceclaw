@@ -76,3 +76,9 @@ apple-watch/build/
 apple-watch/Local.xcconfig
 App_Resources/iOS/watchapp/
 xcuserdata/
+
+# mwlabs: devenv (devenv.nix) state, its generated SDK paths and Android user home
+.devenv*
+devenv.local.nix
+/local.properties
+/.android/
