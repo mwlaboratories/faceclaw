@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -31,6 +32,8 @@ class FaceclawLocationTracker(context: Context) : LocationListener {
          * first frame: the route starts there and arrival fires immediately.
          */
         private const val MAX_SEED_AGE_MS = 60L * 1000L
+        /** Network fixes are dropped while a GPS fix is younger than this. */
+        private const val PREFER_GPS_MS = 10L * 1000L
 
         /** Age via the monotonic clock, so a wall-clock change can't make an old fix look fresh. */
         private fun ageMs(location: Location): Long {
@@ -46,6 +49,8 @@ class FaceclawLocationTracker(context: Context) : LocationListener {
 
     private var listener: FaceclawLocationTrackerListener? = null
     private var running = false
+    private val activeProviders = mutableSetOf<String>()
+    private var lastGpsFixElapsedMs = Long.MIN_VALUE / 2
 
     init {
         val looper = Looper.myLooper()
@@ -89,20 +94,24 @@ class FaceclawLocationTracker(context: Context) : LocationListener {
             return
         }
 
-        val provider = chooseProvider()
-        if (provider == null) {
+        val providers = chooseProviders()
+        if (providers.isEmpty()) {
             deliverError("Turn on Location on your phone, then retry.")
             return
         }
 
         try {
             running = true
-            manager.requestLocationUpdates(provider, Math.max(500L, intervalMs), 0f, this,
-                callbackHandler.looper)
+            activeProviders.clear()
+            for (provider in providers) {
+                manager.requestLocationUpdates(provider, Math.max(500L, intervalMs), 0f, this,
+                    callbackHandler.looper)
+                activeProviders.add(provider)
+            }
             // Seed with the freshest cached fix so the UI has a position
             // before the first live fix (GPS cold starts can take a while),
             // but only if it's recent enough to still be where the user is.
-            val cached = freshestCachedLocation(provider)
+            val cached = freshestCachedLocation(providers)
             if (cached != null) {
                 deliverLocation(cached)
             }
@@ -115,10 +124,10 @@ class FaceclawLocationTracker(context: Context) : LocationListener {
         }
     }
 
-    private fun freshestCachedLocation(primaryProvider: String): Location? {
+    private fun freshestCachedLocation(providers: List<String>): Location? {
         var best: Location? = null
-        for (provider in arrayOf(primaryProvider, LocationManager.NETWORK_PROVIDER,
-                LocationManager.GPS_PROVIDER)) {
+        for (provider in (providers + listOf(LocationManager.NETWORK_PROVIDER,
+                LocationManager.GPS_PROVIDER)).distinct()) {
             val candidate: Location?
             try {
                 candidate = locationManager!!.getLastKnownLocation(provider)
@@ -135,25 +144,44 @@ class FaceclawLocationTracker(context: Context) : LocationListener {
         return best
     }
 
-    private fun chooseProvider(): String? {
+    /**
+     * The fused provider when the platform has it (Android 12+): it blends GPS
+     * with network location, so a fix arrives indoors too. Otherwise GPS and
+     * network together, rather than GPS alone: with GPS on but no sky in view
+     * (indoors), GPS-only tracking never produced a first fix even though
+     * network location was available.
+     */
+    private fun chooseProviders(): List<String> {
+        val manager = locationManager ?: return emptyList()
         try {
-            if (locationManager!!.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-                return LocationManager.GPS_PROVIDER
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                manager.isProviderEnabled(LocationManager.FUSED_PROVIDER)) {
+                return listOf(LocationManager.FUSED_PROVIDER)
             }
-            if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
-                return LocationManager.NETWORK_PROVIDER
-            }
+            return listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+                .filter { manager.isProviderEnabled(it) }
         } catch (ignored: Throwable) {
         }
-        return null
+        return emptyList()
     }
 
     override fun onLocationChanged(location: Location) {
+        // With GPS and network both on, a coarse network fix must not
+        // override a recent GPS one.
+        if (location.provider == LocationManager.GPS_PROVIDER) {
+            lastGpsFixElapsedMs = SystemClock.elapsedRealtime()
+        } else if (location.provider == LocationManager.NETWORK_PROVIDER &&
+            SystemClock.elapsedRealtime() - lastGpsFixElapsedMs < PREFER_GPS_MS) {
+            return
+        }
         deliverLocation(location)
     }
 
     override fun onProviderDisabled(provider: String) {
-        deliverError("Location was turned off on the phone.")
+        activeProviders.remove(provider)
+        if (activeProviders.isEmpty()) {
+            deliverError("Location was turned off on the phone.")
+        }
     }
 
     override fun onProviderEnabled(provider: String) {
